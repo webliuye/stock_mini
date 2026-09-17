@@ -9,13 +9,15 @@
 import re
 import sys
 import time
+import threading
 import yaml
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+from collections import Counter, defaultdict
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from loguru import logger
@@ -30,8 +32,56 @@ CACHE_DIR = Path("data/cache")
 # 缓存文件名正则: {code}_{start}_{end}_{adjust}.parquet
 CACHE_PATTERN = re.compile(r"^(\d{6})_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})_(.+?)\.parquet$")
 
-# 批量请求大小（AlphaFeed batch 接口上限 100）
-BATCH_SIZE = 100
+# AlphaFeed 单请求 symbol 上限。库内默认 100, 但服务端实测放到 200 仍接受
+# (300 报 "标的数量超限: 300 (最大: 200)") —— 用它可以把请求数直接减半。
+MAX_SYMBOLS_PER_REQUEST = 200
+
+# 服务端限流: 实测 429 消息为 "Rate limit exceeded (60/min)"。取 55 留余量,
+# 令牌桶按这个速率放行, 保证不会因为并发 burst 而丢 chunk。
+REQUESTS_PER_MINUTE = 55
+
+# 并发路数。真正的节流由令牌桶负责, 这里只要够把管道填满即可。
+BATCH_WORKERS = 6
+
+
+class _RateLimiter:
+    """令牌桶限速器(线程安全)。
+
+    按固定间隔放行请求, 使客户端整体速率不超过 per_minute。用来卡在
+    AlphaFeed 的 60/min 硬限之下 —— 光靠调低并发并不能解决问题: 并发 12 时
+    53 个请求 19 秒打完(≈165/min), 直接超限丢掉 12 个 chunk。
+    """
+
+    def __init__(self, per_minute: int):
+        self._interval = 60.0 / per_minute
+        self._lock = threading.Lock()
+        self._next_at = time.monotonic()
+
+    def acquire(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            if self._next_at > now:
+                time.sleep(self._next_at - now)
+                now = time.monotonic()
+            self._next_at = max(now, self._next_at) + self._interval
+
+
+def _install_rate_limit(api, per_minute: int = REQUESTS_PER_MINUTE) -> None:
+    """给 AlphaFeed 客户端的 get() 套上限速, 覆盖库内部所有并发请求。
+
+    库的 klines.batch 用线程池并发取数, 从外面没法逐个请求控制节奏, 所以
+    直接包住底层 client.get —— 无论库内起多少线程, 请求都按令牌桶放行。
+    顺带也限住了 instrument 名称解析的请求。
+    """
+    client = api._client
+    original_get = client.get
+    limiter = _RateLimiter(per_minute)
+
+    def paced_get(*args, **kwargs):
+        limiter.acquire()
+        return original_get(*args, **kwargs)
+
+    client.get = paced_get
 
 
 def parse_cache_filename(filename: str) -> Optional[Dict]:
@@ -94,12 +144,17 @@ def to_af_symbol(code: str) -> str:
 
 
 def calculate_count(fetch_start: str, today_str: str) -> int:
-    """估算需要的 K 线数量（AlphaFeed 按 count 返回最新 N 条，需 buffer）"""
+    """估算需要的 K 线数量（AlphaFeed 按 count 返回最新 N 条，需 buffer）。
+
+    请求耗时基本由返回的数据量决定（实测 100 只/次: count=5 → 1.1s,
+    count=300 → 1.4s, count=2800 → 3.8s），所以增量更新时没必要为"保险"
+    多要几百条 —— 只要 count ≥ 区间内的交易日数, 多要的全是浪费。
+    """
     start_dt = datetime.strptime(fetch_start, "%Y-%m-%d")
     end_dt = datetime.strptime(today_str, "%Y-%m-%d")
     diff_days = (end_dt - start_dt).days
-    # 交易日约为自然日 0.7，留 250 条 buffer
-    return min(max(int(diff_days * 0.8) + 250, 300), 10000)
+    # A股交易日约为自然日的 0.68 (243/365)，取 0.8 留余量；+30 覆盖长假/停牌
+    return min(max(int(diff_days * 0.8) + 30, 30), 10000)
 
 
 def _parse_retry_seconds(err: Exception) -> Optional[float]:
@@ -109,98 +164,132 @@ def _parse_retry_seconds(err: Exception) -> Optional[float]:
     return int(m.group(1)) / 1000.0 if m else None
 
 
+def _fetch_symbol_set(
+    api, symbols: List[str], count: int, max_workers: int, label: str
+) -> Dict[str, pd.DataFrame]:
+    """取一批 symbol, 返回 {symbol: df}。
+
+    库内 klines.batch 自己按 MAX_SYMBOLS_PER_REQUEST 切块 + 线程池并发, 且已对
+    429/5xx 做 3 次指数退避重试; 这里只兜底整批彻底失败(返回空 dict)。
+
+    注意: 库内某个 chunk 失败时是**静默吞掉**的 —— 那些 symbol 不会出现在返回
+    的 dict 里, 所以调用方必须自己比对缺失。
+    """
+    from alphafeed import RateLimitError as _RateLimitError
+
+    for attempt in range(3):
+        try:
+            return api.klines.batch(
+                symbols,
+                period="1d",
+                count=count,
+                adjust="forward",
+                to_dataframe=True,
+                batch_size=MAX_SYMBOLS_PER_REQUEST,
+                max_workers=max_workers,
+            )
+        except _RateLimitError as e:
+            if attempt >= 2:
+                print(f"    {label} 限流放弃: {e}", flush=True)
+                return {}
+            wait = _parse_retry_seconds(e) or 20.0
+            print(f"    {label} 限流, 冷却 {wait:.0f}s 后重试 (外层 {attempt+1}/2)", flush=True)
+            time.sleep(wait + 2.0)
+        except Exception as e:
+            print(f"    {label} 失败: {type(e).__name__}: {e}", flush=True)
+            return {}
+    return {}
+
+
+def _standardize_kline_df(df: pd.DataFrame) -> pd.DataFrame:
+    """trade_date -> date, 只留标准列（与单只 get() 的口径一致）。"""
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["trade_date"])
+    cols = ["date", "open", "high", "low", "close", "volume", "amount"]
+    df = df[[c for c in cols if c in df.columns]]
+    return df.sort_values("date").reset_index(drop=True)
+
+
 def batch_fetch(
     api,
     plan: Dict[str, Dict],
     today_str: str,
-    batch_size: int = BATCH_SIZE,
+    max_workers: int = BATCH_WORKERS,
 ) -> Dict[str, Tuple[Optional[pd.DataFrame], str]]:
     """批量拉取 K 线数据。
 
-    使用 AlphaFeed 的 klines.batch()，每次最多 batch_size 只并发请求，
-    大幅减少网络往返次数。AlphaFeed 批次接口限流实测 30/min，客户端内置
-    3 次退避重试仍 429 后抛出 RateLimitError —— 这里每批之间留 ~2.1s
-    (≈28/min 不触顶) 作限速，撞上 429 时再按 Retry-after 冷区外层重试。
+    按 fetch_start 分组后整组交给 AlphaFeed 的 klines.batch() —— 该接口内部会
+    切块并用线程池并发取。两个要点:
+
+    1. 不要自己切 100 只再逐批调用。传入正好 100 只时库内只切出 1 个 chunk, 会走
+       `len(chunks) == 1` 的串行分支, 并发完全用不上 —— 之前就是 53 批纯串行 +
+       批间 sleep 2.1s, 光 sleep 就 110 秒。
+    2. 但也不能只靠加大并发。服务端限流是 60 请求/分钟(实测 429 消息
+       "Rate limit exceeded (60/min)"), 并发 12 时 53 个请求 19 秒打完 ≈165/min,
+       直接超限丢掉 12 个 chunk(400 只股票)。所以用令牌桶把整体速率压在
+       REQUESTS_PER_MINUTE 之下 —— 全市场增量最少也要 5204/200 ≈ 27 个请求,
+       即 ~30 秒, 这是硬下限。
+
+    按 fetch_start 分组还有个好处: 同组共用一个 count, 不会因为批内混进一只
+    无缓存的股票 (fetch_start=2018-01-01) 就把整批 100 只的 count 抬到 2800。
 
     Args:
         api: AlphaFeed 客户端实例
         plan: 拉取计划 {code: {"old_info": ..., "fetch_start": str}}
         today_str: 今天的日期字符串
-        batch_size: 每批股票数
+        max_workers: 并发请求数（节流由令牌桶负责, 这里只决定管道深度）
 
     Returns:
         {code: (df, symbol)}  df 为 None 表示该股票拉取失败
     """
-    from alphafeed import RateLimitError as _RateLimitError
-
     results: Dict[str, Tuple[Optional[pd.DataFrame], str]] = {}
 
-    codes = list(plan.keys())
-    total_batches = (len(codes) + batch_size - 1) // batch_size
+    # 按增量起点分组: 同组 fetch_start 一致, 共用一个 count
+    groups: Dict[str, list] = defaultdict(list)
+    for code, item in plan.items():
+        groups[item["fetch_start"]].append(code)
 
-    for bi in range(total_batches):
-        chunk = codes[bi * batch_size : (bi + 1) * batch_size]
-        symbols = [to_af_symbol(c) for c in chunk]
-        symbol_to_code = {s: c for c, s in zip(chunk, symbols)}
+    if not groups:
+        return results
 
-        # 取该批次最早的 fetch_start，保证覆盖所有股票的增量区间
-        fetch_start = min(plan[c]["fetch_start"] for c in chunk)
+    _install_rate_limit(api)
+    print(f"  按增量起点分 {len(groups)} 组, "
+          f"{MAX_SYMBOLS_PER_REQUEST} 只/请求, 并发 {max_workers} 路, "
+          f"限速 {REQUESTS_PER_MINUTE}/min", flush=True)
+
+    for gi, (fetch_start, codes) in enumerate(sorted(groups.items()), 1):
+        symbols = [to_af_symbol(c) for c in codes]
+        symbol_to_code = {s: c for c, s in zip(codes, symbols)}
         count = calculate_count(fetch_start, today_str)
+        label = f"组 {gi}/{len(groups)}"
+        n_req = (len(symbols) + MAX_SYMBOLS_PER_REQUEST - 1) // MAX_SYMBOLS_PER_REQUEST
 
-        # 批间限速: 30/min 限制留余量
-        if bi > 0:
-            time.sleep(2.1)
+        t0 = time.time()
+        dfs_map = _fetch_symbol_set(api, symbols, count, max_workers, label)
 
-        dfs_map, got = None, False
-        for attempt in range(6):
-            try:
-                dfs_map = api.klines.batch(
-                    symbols,
-                    period="1d",
-                    count=count,
-                    adjust="forward",
-                    to_dataframe=True,
-                )
-                got = True
-                break
-            except _RateLimitError as e:
-                if attempt >= 5:
-                    print(f"    批次 {bi+1}/{total_batches} 限流放弃: {e}", flush=True)
-                    break
-                wait = _parse_retry_seconds(e) or 20.0
-                print(f"    批次 {bi+1}/{total_batches} 限流, 冷却 {wait:.0f}s 后重试 "
-                      f"(外层 {attempt+1}/5)", flush=True)
-                time.sleep(wait + 2.0)
-            except Exception as e:
-                print(f"    批次 {bi+1}/{total_batches} 失败: {type(e).__name__}: {e}", flush=True)
-                break
+        # 库内失败的 chunk 是静默丢掉的, 这里把缺失的 symbol 捞出来补一次。
+        # 限流是概率性的, 重取一趟基本都能拿到, 比直接判失败划算。
+        missing = [s for s in symbols if s not in dfs_map]
+        if missing:
+            print(f"    {label} 缺 {len(missing)} 只, 补取一次 ...", flush=True)
+            retry_map = _fetch_symbol_set(api, missing, count, max_workers, f"{label} 补取")
+            dfs_map.update(retry_map)
 
-        if not got or dfs_map is None:
-            for c in chunk:
-                results[c] = (None, to_af_symbol(c))
-            continue
-
-        # dfs_map: {symbol: DataFrame}
+        # dfs_map: {symbol: DataFrame}; 仍未出现的按失败处理
         for symbol, df in dfs_map.items():
             code = symbol_to_code.get(symbol)
             if code is None or df is None or df.empty:
                 continue
-            # 标准化列: trade_date -> date（与单只 get() 一致）
-            df = df.copy()
-            df["date"] = pd.to_datetime(df["trade_date"])
-            cols = ["date", "open", "high", "low", "close", "volume", "amount"]
-            df = df[[c for c in cols if c in df.columns]]
-            df = df.sort_values("date").reset_index(drop=True)
-            results[code] = (df, symbol)
+            results[code] = (_standardize_kline_df(df), symbol)
 
-        # 该批次中缺失的标记为失败
         done_symbols = set(dfs_map.keys())
         for symbol, code in symbol_to_code.items():
             if symbol not in done_symbols:
                 results[code] = (None, symbol)
 
-        ok_count = sum(1 for s in symbol_to_code if s in done_symbols)
-        print(f"    批次 {bi+1}/{total_batches}: {len(chunk)} 只，成功 {ok_count} 只", flush=True)
+        print(f"    {label} (起点 {fetch_start}, count={count}): {len(codes)} 只, "
+              f"成功 {len(done_symbols)} 只, {n_req} 个请求, "
+              f"耗时 {time.time()-t0:.1f}s", flush=True)
 
     return results
 
@@ -415,7 +504,6 @@ def main(auto_confirm: bool = False):
             print(f"  ✅ 数据已是最新")
         
         # 按日期分组统计
-        from collections import Counter
         date_counts = Counter(info["end_date"] for info in cache_info.values())
         print(f"\n  各截止日期股票数量:")
         for d in sorted(date_counts.keys()):
@@ -445,7 +533,8 @@ def main(auto_confirm: bool = False):
         return
     
     print(f"\n🔄 需要更新 {need_update_count} 只股票的数据")
-    print(f"   将批量拉取，每批 {BATCH_SIZE} 只并发请求")
+    print(f"   批量拉取 ({MAX_SYMBOLS_PER_REQUEST} 只/请求, 并发 {BATCH_WORKERS} 路, "
+          f"限速 {REQUESTS_PER_MINUTE}/min —— 服务端硬限 60/min)")
     
     # 如果有很多需要更新，给个提示
     if need_update_count > 100:

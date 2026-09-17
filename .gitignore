@@ -1,1 +1,23 @@
+# ---- 密钥 / 本地配置 (从 beifen 拷来, 不进版本库) ----
 config.yaml
+
+# ---- 运行环境 ----
+.venv/
+.venv-*/
+venv/
+
+# ---- 数据缓存 (471MB, 由 update_daily_data.py 生成) ----
+# 注意: data/all_stocks.csv / .parquet 是要提交的股票池, 不能整目录忽略
+data/cache/
+data/cache_raw_none/
+data/market.db
+
+# ---- 运行产物 ----
+reports/
+logs/
+*.pkl
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.DS_Store

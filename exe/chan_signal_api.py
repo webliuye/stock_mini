@@ -14,8 +14,10 @@
 
   from chan_signal_api import recent_chan_signals_both
   df3, df1 = recent_chan_signals_both(days=5)     # 三买/一买各自独立, 不递补
-  df 列: code,name,kind,buy_date,close,entry_ret,bucket,board,is_down,
+  df 列: code,name,kind,buy_date,close,entry_ret,today_ret,bucket,board,is_down,
          zg_ext,depth,gap,ratio
+         entry_ret=买点触发那根的涨跌(仅用于排序和"收跌/收涨"列),
+         today_ret=今日涨跌(最新一根 bar 相对前一交易日, 页面展示用)
 """
 import sys
 import os
@@ -35,6 +37,10 @@ from myquant.strategy.chan_common import DEFAULT_PARAMS, scan_points
 from realtime_snapshot import fetch_realtime_bars, append_today_bar
 
 CACHE = Path("reports/chan_recent_signals.pkl")
+
+# 缓存结构版本。改 _to_df 的列(增删/改名)时必须 +1, 否则当天的旧 pkl 会被当成
+# 有效缓存读出来, 少一列直接报错。
+CACHE_SCHEMA = 2
 
 NAMES = {}
 try:
@@ -93,6 +99,9 @@ def scan_all(days):
         dates = df["date"]
         close = df["close"].astype(float).to_numpy()
         low = df["low"].astype(float).to_numpy()
+        # 今日涨跌 = 最新一根 bar（已含上面追加的当日 bar）相对前一交易日的涨跌幅。
+        # 与 entry_ret 不同: entry_ret 是买点触发那根的涨跌, 「明日可买」时恒为 0。
+        day_ret = float(close[n - 1] / close[n - 2] - 1) if n >= 2 and close[n - 2] > 0 else 0.0
         segs, _ = build_structure(df, "canonical")
         if len(segs) < 8:
             continue
@@ -120,7 +129,8 @@ def scan_all(days):
                 px = float(close[ex])
             rec = dict(code=code, name=str(NAMES.get(code, "")).replace(" ", ""),
                        kind=e["kind"], buy_date=bd, date_sort=ds, close=round(px, 2),
-                       entry_ret=round(er * 100, 2), bucket=bucket,
+                       entry_ret=round(er * 100, 2), today_ret=round(day_ret * 100, 2),
+                       bucket=bucket,
                        board=board_label(code), board_prio=board_prio(code),
                        is_down=int(er < 0))
             if e["kind"] == "buy3":
@@ -178,8 +188,8 @@ def check_freshness():
 
 
 def _to_df(recs):
-    cols = ["code", "name", "kind", "buy_date", "close", "entry_ret", "bucket",
-            "board", "is_down", "zg_ext", "depth", "gap", "ratio"]
+    cols = ["code", "name", "kind", "buy_date", "close", "entry_ret", "today_ret",
+            "bucket", "board", "is_down", "zg_ext", "depth", "gap", "ratio"]
     df = pd.DataFrame(recs)
     for c in cols:
         if c not in df.columns:
@@ -187,7 +197,8 @@ def _to_df(recs):
     df["kind_label"] = df["kind"].map({"buy3": "三买", "buy1": "一买"})
     df["is_down_label"] = df["is_down"].map({0: "收涨", 1: "收跌"})
     return df[["code", "name", "kind_label", "buy_date", "close", "entry_ret",
-               "is_down_label", "bucket", "board", "zg_ext", "depth", "gap", "ratio"]]
+               "today_ret", "is_down_label", "bucket", "board",
+               "zg_ext", "depth", "gap", "ratio"]]
 
 
 def _scan_and_cache(days, today):
@@ -197,8 +208,10 @@ def _scan_and_cache(days, today):
     buy1 = [r for r in recs if r["kind"] == "buy1"]
     df3 = _to_df(sort_recs(buy3))
     df1 = _to_df(sort_recs(buy1))
+    CACHE.parent.mkdir(parents=True, exist_ok=True)   # reports/ 不进版本库, 首次运行可能不存在
     with open(CACHE, "wb") as f:
-        pickle.dump({"days": days, "date": today, "df3": df3, "df1": df1}, f)
+        pickle.dump({"schema": CACHE_SCHEMA, "days": days, "date": today,
+                     "df3": df3, "df1": df1}, f)
     return df3, df1
 
 
@@ -207,7 +220,9 @@ def _load_both_cache(days, today):
         try:
             with open(CACHE, "rb") as f:
                 c = pickle.load(f)
-            if c.get("days") == days and c.get("date") == today and "df3" in c:
+            if (c.get("schema") == CACHE_SCHEMA and c.get("days") == days
+                    and c.get("date") == today and "df3" in c
+                    and "today_ret" in getattr(c["df3"], "columns", [])):
                 return c["df3"], c["df1"]
         except Exception:
             pass

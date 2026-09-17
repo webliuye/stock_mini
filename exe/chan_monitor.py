@@ -64,11 +64,11 @@ if refresh:
 
 DISPLAY_COLS = {
     "code": "代码", "name": "名称", "kind_label": "买点", "buy_date": "买入日",
-    "close": "买入价", "entry_ret": "买入日涨跌%", "is_down_label": "收跌/收涨",
+    "close": "买入价", "today_ret": "今日涨跌%", "is_down_label": "收跌/收涨",
     "bucket": "状态", "board": "板块", "zg_ext": "zg_ext%", "depth": "depth%",
     "gap": "gap(日)", "ratio": "背驰比",
 }
-ORDER = ["代码", "名称", "买点", "买入日", "买入价", "买入日涨跌%", "收跌/收涨",
+ORDER = ["代码", "名称", "买点", "买入日", "买入价", "今日涨跌%", "收跌/收涨",
          "状态", "板块", "zg_ext%", "depth%", "gap(日)", "背驰比"]
 
 
