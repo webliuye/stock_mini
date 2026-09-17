@@ -1,0 +1,13 @@
+# 缠论买点监控页 - 最小依赖 (macOS / Windows 通用)
+streamlit>=1.60
+pandas>=2.0
+numpy>=1.24
+pyyaml>=6.0
+loguru>=0.7
+pyarrow>=15.0
+
+# 数据源: 私有付费包 (需账号, 见 README「配置数据源」)
+alphafeed>=0.1.4
+
+# 免费替代数据源 (可选): 把 config.yaml 的 data.source 改为 akshare 后启用
+# akshare>=1.11
